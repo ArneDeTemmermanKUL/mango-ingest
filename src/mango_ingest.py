@@ -205,25 +205,29 @@ def irods_mkdir_p(irods_session: iRODSSession, collection_path: str):
 def bulk_add_metadata(
     item: iRODSDataObject | iRODSCollection,
     metadata_items: dict,
-    unit_text: str = "analysis/mango_ingest",
     as_admin=False,
-    prefix="",
+    metadata_option_name_prefix="",
+    metadata_option_unit_value="",
 ):
     if metadata_items:
         metadata_names = metadata_items.keys()
         avu_operations = [
             AVUOperation(operation="remove", avu=avu)
             for avu in item.metadata.items()
-            if avu.name in metadata_names
+            if f"{metadata_option_name_prefix}{avu.name}" in metadata_names
         ]
         for m_name, m_value in metadata_items.items():
-            m_name = prefix + m_name
+            m_name = metadata_option_name_prefix + m_name
             if type(m_value) == list:
                 avu_operations.extend(
                     [
                         AVUOperation(
                             "add",
-                            iRODSMeta(name=m_name, value=sub_value, units=unit_text),
+                            iRODSMeta(
+                                name=m_name,
+                                value=sub_value,
+                                units=metadata_option_unit_value,
+                            ),
                         )
                         for sub_value in m_value
                     ]
@@ -233,7 +237,9 @@ def bulk_add_metadata(
                 avu_operations.append(
                     AVUOperation(
                         operation="add",
-                        avu=iRODSMeta(name=m_name, value=m_value, units=unit_text),
+                        avu=iRODSMeta(
+                            name=m_name, value=m_value, units=metadata_option_unit_value
+                        ),
                     )
                 )
             else:
@@ -405,6 +411,8 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
         self.filter_kwargs = kwargs.pop("filter_kwargs", None)
         self.verify_checksum = kwargs.pop("verify_checksum", False)
         self.metadata_handlers = kwargs.pop("metadata_handlers", [])
+        self.metadata_option_unit_value=kwargs.pop("metadata_option_unit_value",""),
+        self.metadata_option_name_prefix=kwargs.pop("metadata_option_name_prefix",""),
         interval = kwargs.pop("queue_interval", 10)
         time_at_rest_criterion = kwargs.pop("time_at_rest_criterion", 4)
 
@@ -561,6 +569,8 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
                 local_base_path=self.path,
                 verify_checksum=self.verify_checksum,
                 metadata_handlers=self.metadata_handlers,
+                metadata_option_unit_value=self.metadata_option_unit_value,
+                metadata_option_name_prefix=self.metadata_option_name_prefix,
             )
             global latest_result_time
             latest_result_time = datetime.datetime.now(datetime.timezone.utc)
@@ -667,6 +677,8 @@ def upload_to_irods(
     local_base_path: pathlib.Path | None = None,
     verify_checksum=False,
     metadata_handlers: list[(Callable, dict)] = [],
+    metadata_option_name_prefix="",
+    metadata_option_unit_value="",
 ):
     ## update the global busy uploading flag
     global busy_uploading
@@ -778,7 +790,10 @@ def upload_to_irods(
                 metadata_dict |= metadata_handler(str(local_path), **kwargs)
             if metadata_dict:
                 bulk_add_metadata(
-                    item=result_object, metadata_items=metadata_dict, prefix="mg."
+                    item=result_object,
+                    metadata_items=metadata_dict,
+                    metadata_option_unit_value=metadata_option_unit_value,
+                    metadata_option_name_prefix=metadata_option_name_prefix,
                 )
                 print(
                     f"Added {len(metadata_dict)} metadata items to {result_object.name}"
@@ -812,6 +827,8 @@ def do_initial_sync_and_or_restart(
     ignore=None,
     verify_checksum=False,
     metadata_handlers: list[(Callable, dict)] = [],
+    metadata_option_name_prefix="",
+    metadata_option_unit_value="",
 ) -> dict:
 
     path_objects = []
@@ -879,6 +896,8 @@ def do_initial_sync_and_or_restart(
                     local_base_path=path,
                     verify_checksum=verify_checksum,
                     metadata_handlers=metadata_handlers,
+                    metadata_option_name_prefix=metadata_option_name_prefix,
+                    metadata_option_unit_value=metadata_option_unit_value,
                 )
                 if upload_result:
                     result["success"].append(get_upload_status_record(full_path))
@@ -987,6 +1006,26 @@ def do_initial_sync_and_or_restart(
     "--md-handler-kwargs",
     help="kwargs parameters for the metadata-handler as a json string",
 )
+@click.option(
+    "--metadata-option-name-prefix",
+    default="mg.",
+    help="set prefix for extracted metadata name Avu",
+)
+@click.option(
+    "--metadata-option-unit-value",
+    default="analysis/mango_ingest",
+    help="set unit value for extracted metadata avU",
+)
+@click.option(
+    "--metadata-verbatim",
+    is_flag=True,
+    help="leave all metadata items as they are (same as specifying empty values for the --metadata-option-* parameters)",
+)
+@click.option(
+    "--irods-session-refresh",
+    default=3000,
+    help="set irods session maximum lifetime (in seconds) before a fresh session is created (lazy)",
+)
 @click.pass_context
 def mango_ingest(
     ctx,
@@ -1011,6 +1050,10 @@ def mango_ingest(
     metadata_mtime,
     metadata_handler,
     metadata_handler_kwargs,
+    metadata_option_name_prefix,
+    metadata_option_unit_value,
+    metadata_verbatim,
+    irods_session_refresh,
 ):
     """
     ManGO ingest is a lightweight tool to monitor a local directory for file changes and ingest (part of) them into iRODS.
@@ -1227,6 +1270,8 @@ def mango_ingest(
                 restart_paths=restart_paths,
                 verify_checksum=verify_checksum,
                 metadata_handlers=metadata_handlers,
+                metadata_option_name_prefix=metadata_option_name_prefix,
+                metadata_option_unit_value=metadata_option_unit_value,
             )
 
         if not no_watch:
@@ -1238,11 +1283,13 @@ def mango_ingest(
                     filter=filter_func,
                     filter_kwargs=filter_func_kwargs,
                     verify_checksum=verify_checksum,
-                    metadata_handlers=metadata_handlers,
                     regexes=regex,  # class RegexMatchingEventHandler
                     ignore_regexes=ignore,  # class RegexMatchingEventHandler
                     ignore_directories=True,  # class RegexMatchingEventHandler
                     observer=observer,
+                    metadata_handlers=metadata_handlers,
+                    metadata_option_name_prefix=metadata_option_name_prefix,
+                    metadata_option_unit_value=metadata_option_unit_value,
                 ),
                 recursive=recursive,
                 observer=observer,
