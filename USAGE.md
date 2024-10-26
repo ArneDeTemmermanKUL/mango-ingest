@@ -61,7 +61,7 @@ Usage: mango_ingest [OPTIONS] COMMAND [ARGS]...
 
   The builtin sub command `generate-config` will create such a yaml formatted
   config file for you.
-
+```
 Options:
   -v, --verbose                   Show runtime messages  [default: 0]
   -r, --recursive                 Also watch sub directories
@@ -130,3 +130,4 @@ Commands:
   examples         Examples
   generate-config  Generate a YAML config template
   show             Show parameter and values as would be used given the...
+```
