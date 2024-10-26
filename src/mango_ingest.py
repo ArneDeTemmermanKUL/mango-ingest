@@ -52,6 +52,7 @@ class MangoIngestException(Exception):
 ##### global variables / objects
 
 ## basic runtime control
+irods_sanity_path = None
 verbosity_level = 0
 dry_run = False
 console = Console()
@@ -1113,7 +1114,7 @@ def mango_ingest(
         # since the option is not marked as required in order to have the option fall back
         # through environment variables and/or config file, we need to check and get it here
         if not destination:
-            destination = click.prompt("Please enter an iRODS destination patha")
+            destination = click.prompt("Please enter an iRODS destination path")
 
         if verbose or do_dry_run:
             global verbosity_level
@@ -1176,6 +1177,26 @@ def mango_ingest(
         global irods_session
         if not (irods_session := get_irods_session()):
             exit("Cannot obtain a valid irods session")
+
+        # check if destination exists/ is reachable
+        # this check should be controllable by another setting to create the destination
+        # path if it does not exist
+        try:
+            irods_session.collections.get(destination)
+        except Exception as e:
+            username = irods_session.username
+            irods_session.cleanup()
+            exit(
+                f"iRODS destination {destination} is not reachable, check if it exists and verify access rights for {username}"
+            )
+
+        # process metadata options
+        if metadata_verbatim:
+            metadata_option_name_prefix = metadata_option_unit_value = ""
+
+        global irods_session_refresh_interval
+        if irods_session_refresh and irods_session_refresh > 0:
+            irods_session_refresh_interval = irods_session_refresh
 
         sync_glob = None
         if sync or no_watch:
