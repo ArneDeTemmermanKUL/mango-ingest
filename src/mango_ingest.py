@@ -94,9 +94,6 @@ def print(*args, verbosity=1, **kwargs):
 # now even go further, also imported modules will get the overridden print method
 builtins.print = print
 
-## simple caching and re-use, to expand like mango flow/ mango portal with expiry checks?
-irods_session: iRODSSession | None = None
-
 
 def now_as_utc_timestamp() -> float:
     return datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
@@ -143,13 +140,28 @@ def get_upload_status_record(
 
 
 ## session init
-def get_irods_session() -> iRODSSession:
 
-    # need to check session timeout for long running operations, copy management from mango portal?
-    # although its likely used using a long valid ingress account when deployed in production
+## simple caching and re-use, to expand like mango flow/ mango portal with expiry checks?
+irods_session: iRODSSession | None = None
+irods_session_refresh_interval = 3600  # in seconds, default 1 hour
 
-    if irods_session:
+
+def get_irods_session(backoff=None) -> iRODSSession:
+    global irods_session
+
+    # if the irods_session is fresh enough, return it after validation
+    if irods_session and irods_session.mi_created > (
+        now_as_utc_timestamp() - irods_session_refresh_interval
+    ):
         return irods_session
+
+    # refresh if session is older than  irods_session_refresh_interval
+    # try to cleanup current, but ignore fatal errors
+    if irods_session:
+        try:
+            irods_session.cleanup()
+        except Exception as e:
+            print(f"Cleanup of irods_session resulted in exception {e}")
 
     try:
         env_file = os.environ["IRODS_ENVIRONMENT_FILE"]
@@ -160,7 +172,13 @@ def get_irods_session() -> iRODSSession:
     )
     ssl_settings = {"ssl_context": ssl_context}
 
-    return iRODSSession(irods_env_file=env_file, **ssl_settings)
+    irods_session = iRODSSession(
+        irods_env_file=env_file, **ssl_settings, application_name="ManGO Ingest"
+    )
+    setattr(irods_session, "mi_created", now_as_utc_timestamp())
+    print(f"Created a fresh irods session with timestamp {irods_session.mi_created}")
+
+    return irods_session
 
 
 ## cache helper for irods_mkdir_p below
