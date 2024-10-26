@@ -60,7 +60,7 @@ console = Console()
 # upload_to_irods function
 busy_uploading = False
 # for PRC >=2.1.0, use native callback for progressbar
-progress_bar_irods = True if version_as_tuple() >= (2,1,0) else False
+progress_bar_irods = True if version_as_tuple() >= (2, 1, 0) else False
 
 ## global result variables
 result = {
@@ -193,7 +193,9 @@ def cache_key_path_only(irods_sesion, collection_path):
 )
 def irods_mkdir_p(irods_session: iRODSSession, collection_path: str):
     try:
-        irods_session.collections.create(collection_path)
+        # recurse=True is the default, but make it explicit for you the reader of this
+        # code that we really want this :-)
+        irods_session.collections.create(collection_path, recurse=True)
     except Exception as e:
         # should ideally be more specific, if the collection alreay exists, fine,
         # if any other exception, should exit()
@@ -580,7 +582,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
     # on_closed is called when writing to a file has finished and the handler is closed
     # native for linux
     def on_closed(self, event: FileSystemEvent) -> None:
-
+        # the only event we are sure it is safe to upload immediately
         # remove delay queue entry for this path if it exists, otherwise
         # it may be uploaded twice
         self.remove_delay_event_via_path(event.src_path)
@@ -708,13 +710,12 @@ def upload_to_irods(
                 )
             ),
         )
-    
+
     # consruct the irods destination full path
     dst_path = str(
         pathlib.PurePosixPath(irods_collection, str(rel_local_path.as_posix()))
     )
     print(f"Destination path for upload is {dst_path}", verbosity=2)
-
 
     if progress_bar_irods:
 
@@ -750,12 +751,13 @@ def upload_to_irods(
                     break
                 yield data
 
-        
-        #make the local read buffer 32MB
+        # make the local read buffer 32MB
         buffering = 32 * 1024 * 1024
-        #open the file with cool 'Rich' progress bar as a console display asset which implictely decorates a regular open()
+        # open the file with cool 'Rich' progress bar as a console display asset which implictely decorates a regular open()
         with rich.progress.open(local_path, "rb", buffering=buffering) as f:
-            with irods_session.data_objects.open(dst_path, "w", auto_close=True) as f_dst:
+            with irods_session.data_objects.open(
+                dst_path, "w", auto_close=True
+            ) as f_dst:
                 for chunk in read_in_chuncks(f):
                     f_dst.write(chunk)
 
@@ -930,8 +932,8 @@ def do_initial_sync_and_or_restart(
     type=click.Choice(["native", "polling"]),
     help="The observer system to use for getting changed paths. "
     "Defaults to 'polling' which is recommended for most use cases, but you can use also 'native' "
-    "for linux/mac filesystems when watching for new files that are directly written into the directory"
-    "polling is a rather brute force algorithm, needed for network mounted drives and windows for example",
+    "for linux/mac filesystems when watching for new files that are directly written into the directory. "
+    "Polling is a rather brute force algorithm, needed for network mounted drives and windows for example",
 )
 @click.option(
     "--polling-interval",
@@ -1330,7 +1332,7 @@ def mango_ingest(
 @mango_ingest.command()
 @click.pass_context
 def examples(ctx):
-    """
+    r"""
     Examples
 
     The examples below assume the executable is in your PATH. Note that the order of the options does not matter
