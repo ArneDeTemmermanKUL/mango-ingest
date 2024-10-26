@@ -575,6 +575,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
                 metadata_option_unit_value=self.metadata_option_unit_value,
                 metadata_option_name_prefix=self.metadata_option_name_prefix,
             )
+            # update timer for reporting
             global latest_result_time
             latest_result_time = datetime.datetime.now(datetime.timezone.utc)
         return

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mango_ingest"
+description = "A lightweight, metadata capable, extensible pure Python ingest tool for iRODS"
+keywords = ["iRODS", "ingest", "Python", "metadata", "automation"]
+version = "0.9.3"
+license = { text = "BSD-3-Clause" }
+authors = [
+    { "name" = "Paul Borgermans", "email" = "paul.borgermans@kuleuven.be" },
+    { "name" = "Jef Scheepers", "email" = "jef.scheepers@kuleuven.be" },
+]
+maintainers = [
+    { name = "Paul Borgermans", email = "paul.borgermans@kuleuven.be" },
+]
+
+dependencies = [
+    'Click',
+    'rich',
+    'python_irodsclient',
+    'cachetools',
+    'pip',
+    'PyYAML',
+    'cachetools',
+    'watchdog',
+]
+readme = "README.md"
+
+[project.scripts]
+mango_ingest = "mango_ingest:entry_point"
+
+[project.urls]
+Homepage = "https://github.com/kuleuven/mango-ingest"
+Documentation = "https://github.com/kuleuven/mango-ingest"
+Repository = "https://github.com/kuleuven/mango-ingest.git"
+Issues = "https://github.com/kuleuven/mango-ingest/issues"
+Changelog = "https://github.com/me/spam/blob/master/CHANGELOG.md"
