@@ -174,7 +174,10 @@ def get_irods_session(backoff=None) -> iRODSSession:
     ssl_settings = {"ssl_context": ssl_context}
 
     irods_session = iRODSSession(
-        irods_env_file=env_file, **ssl_settings, application_name="ManGO Ingest"
+        irods_env_file=env_file,
+        **ssl_settings,
+        application_name="ManGO Ingest",
+        connection_refresh_time = max(int(irods_session_refresh_interval/5), 600)
     )
     setattr(irods_session, "mi_created", now_as_utc_timestamp())
     print(f"Created a fresh irods session with timestamp {irods_session.mi_created}")
@@ -414,10 +417,10 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
         self.filter_kwargs = kwargs.pop("filter_kwargs", None)
         self.verify_checksum = kwargs.pop("verify_checksum", False)
         self.metadata_handlers = kwargs.pop("metadata_handlers", [])
-        self.metadata_option_unit_value=kwargs.pop("metadata_option_unit_value",""),
-        self.metadata_option_name_prefix=kwargs.pop("metadata_option_name_prefix",""),
+        self.metadata_option_unit_value = kwargs.pop("metadata_option_unit_value", "")
+        self.metadata_option_name_prefix = kwargs.pop("metadata_option_name_prefix", "")
         interval = kwargs.pop("queue_interval", 10)
-        time_at_rest_criterion = kwargs.pop("time_at_rest_criterion", 4)
+        time_at_rest_criterion = kwargs.pop("time_at_rest_criterion", interval)
 
         # delay queue
         self.delay_queue = {}
@@ -464,7 +467,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
             self.delay_queue_last_visit = now_as_utc_timestamp()
             self.delay_queue_lock.acquire()
             print(
-                f"Processing {len(self.delay_queue)} items in delay queue", verbosity=2
+                f"Processing {len(self.delay_queue)} items in delay queue", verbosity=3
             )
             for path, item in self.delay_queue.items():
                 # check if mtime has changed since the recorded mtime
@@ -474,6 +477,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
                 current_path_mtime = pathlib.Path(path).stat().st_mtime
                 now_as_timestamp = now_as_utc_timestamp()
                 if current_path_mtime != item["event_path_mtime"]:
+                    # item has been modified since last check
                     # set to the reported value, which for whatever reason can be far different from now()
                     self.delay_queue[path]["event_path_mtime"] = current_path_mtime
                     self.delay_queue[path]["event_timestamp"] = now_as_timestamp
@@ -1027,8 +1031,8 @@ def do_initial_sync_and_or_restart(
 )
 @click.option(
     "--irods-session-refresh",
-    default=3000,
-    help="set irods session maximum lifetime (in seconds) before a fresh session is created (lazy)",
+    default=3600,
+    help="set irods session maximum lifetime (in seconds) after which a fresh session is created (lazy)",
 )
 @click.pass_context
 def mango_ingest(
