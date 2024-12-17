@@ -52,9 +52,17 @@ class MangoIngestException(Exception):
 ##### global variables / objects
 
 ## basic runtime control
-irods_sanity_path = None
+# core arguments
+local_base_dir = None
+irods_destination = None
+# logging parameter, by default nothing is printed except fatal errors
 verbosity_level = 0
+# run mode
 dry_run = False
+# How to treat symlinks (linux/mac), None means just treat them as regular files
+# other options are 'ignore', 'ignore-log', 'metadata'
+symlink_strategy = "follow"
+## global helper variable for stdout using Rich module
 console = Console()
 # adaptive sleep times enabler, this variable is controlled by the core
 # upload_to_irods function
@@ -177,7 +185,7 @@ def get_irods_session(backoff=None) -> iRODSSession:
         irods_env_file=env_file,
         **ssl_settings,
         application_name="ManGO Ingest",
-        connection_refresh_time = max(int(irods_session_refresh_interval/5), 600)
+        refresh_time=max(int(irods_session_refresh_interval / 5), 600),
     )
     setattr(irods_session, "mi_created", now_as_utc_timestamp())
     print(f"Created a fresh irods session with timestamp {irods_session.mi_created}")
@@ -186,7 +194,7 @@ def get_irods_session(backoff=None) -> iRODSSession:
 
 
 ## cache helper for irods_mkdir_p below
-def cache_key_path_only(irods_sesion, collection_path):
+def cache_key_path_only(irods_session, collection_path):
     return hashkey(collection_path)
 
 
@@ -204,6 +212,36 @@ def irods_mkdir_p(irods_session: iRODSSession, collection_path: str):
         # if any other exception, should exit()
         print(e)
     return collection_path
+
+
+# short lived cache in use: it may be used to check for links but also return symlink info as metadata
+# after upload (not implemented yet).
+@cachetools.cached(cache=TTLCache(maxsize=500, ttl=(120 * 60)))
+def check_symlink(
+    path: str | pathlib.Path, base_path: str | None = None, recursive=True
+) -> list:
+    detected_symlinks = []
+    path_to_check = pathlib.Path(path)
+    if base_path:
+        path_to_check = path_to_check.relative_to(base_path)
+    if path_to_check.is_symlink():
+        detected_symlinks.append(
+            (
+                str(path_to_check),
+                str(path_to_check.readlink()),
+            )
+        )
+    if recursive:
+        # avoid the "." or "/" check
+        for parent in path_to_check.parents[:-1]:
+            if parent.is_symlink():
+                detected_symlinks.append(
+                    (
+                        str(parent),
+                        str(parent.readlink()),
+                    )
+                )
+    return detected_symlinks
 
 
 # This function is copied from ManGO Flow: safely add or replace AVU triplets
@@ -347,6 +385,54 @@ def check_filters(
     return True
 
 
+def check_path_upload_eligibility(
+    file_path: pathlib.Path,
+    regexes: list | None = None,
+    filters: list | None = None,
+    filter_strategy: str = "and",
+    filter_log: str | bool = False, # not implemented yet
+) -> bool:
+
+    # create empty iterators
+    if regexes is None:
+        regexes = []
+    if filters is None:
+        filters = []
+
+    regex_match = False if regexes else True # if no regexes, it is treaded as regex match anything
+    if regexes and any(re.search(pattern, str(file_path)) for pattern in regexes):
+        regex_match = True
+    filters_matches = []
+    if filter_strategy.lower() == "or" and regexes and regex_match:
+        # do not bother to execue the filters. But this is an unlikely use case
+        return True
+    for (filter, filter_kwargs) in filters:
+        print(
+            f"validating against custom filter  with {filter_kwargs}",
+            style="bold blue",
+            verbosity=2,
+        )
+        try:
+            if not filter(file_path, **filter_kwargs):
+                print("external rule returned False", style="red bold")
+                filters_matches.append(False)
+            else:
+                filters_matches.append(True)
+        except Exception as e:
+            print(
+                f"An error occurred with external validation: {e} .. Continuing though"
+            )
+            filters_matches.append(False)
+        filters_matches.append(regex_match)
+    overall_result = (
+        all(filters_matches)
+        if filter_strategy.lower() == "and"
+        else any(filters_matches)
+    )
+    # potentially log this later
+    return overall_result
+
+
 ## watcher class
 class ManGOIngestWatcher(object):
     """ """
@@ -415,6 +501,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
         self.observer = observer
         self.filter = kwargs.pop("filter", None)
         self.filter_kwargs = kwargs.pop("filter_kwargs", None)
+        self.filters = kwargs.pop("filters", None)
         self.verify_checksum = kwargs.pop("verify_checksum", False)
         self.metadata_handlers = kwargs.pop("metadata_handlers", [])
         self.metadata_option_unit_value = kwargs.pop("metadata_option_unit_value", "")
@@ -536,8 +623,16 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
         if any(r.search(p) for r in self.ignore_regexes for p in paths):
             return
 
-        if any(r.search(p) for r in self.regexes for p in paths):
-            super().dispatch(event)
+        # if any(r.search(p) for r in self.regexes for p in paths):
+        #     super().dispatch(event)
+        for p in paths:
+            if check_path_upload_eligibility(file_path=pathlib.Path(p), regexes=self.regexes, filters=self.filters):
+                # add reporting on the matches list
+                super().dispatch(event)
+            else:
+                # add reporting on the ignore list
+                pass
+
 
     def handle_event(self, event: FileSystemEvent):
         # exclude directory creation, we are ony interested in files (for now)
@@ -830,6 +925,7 @@ def do_initial_sync_and_or_restart(
     regex=[],
     filter=None,
     filter_kwargs=None,
+    filters=None,
     glob="*",
     restart_paths=[],  # list of path strings
     ignore=None,
@@ -857,13 +953,16 @@ def do_initial_sync_and_or_restart(
             ):
                 print(f"ignoring {full_path}", verbosity=2)
                 continue
-
-            if check_filters(
-                full_path,
-                regexes=regex,
-                filter=filter,
-                filter_kwargs=filter_kwargs,
+            if check_path_upload_eligibility(
+                file_path=full_path, regexes=regex, filters=filters
             ):
+
+                # if check_filters(
+                #     full_path,
+                #     regexes=regex,
+                #     filter=filter,
+                #     filter_kwargs=filter_kwargs,
+                # ):
                 result["matched"].append(get_upload_status_record(full_path))
                 if dry_run:
                     print(f"dry-run: would upload {full_path}")
@@ -912,7 +1011,7 @@ def do_initial_sync_and_or_restart(
                 else:
                     result["failed"].append(get_upload_status_record(full_path))
             else:
-                result["ingnored"].append(get_upload_status_record(full_path))
+                result["ignored"].append(get_upload_status_record(full_path))
                 continue
         else:
             print(f" did not treat local dir {path_object}", verbosity=2)
@@ -956,11 +1055,18 @@ def do_initial_sync_and_or_restart(
 )
 @click.option(
     "--filter-func",
-    help="use an external filter (along regex/glob patterns), it will be dynamically imported",
+    help="use an external filter (along regex/glob patterns), it will be dynamically imported [DEPRECATED, use --filter which accepts muliple fnctions]",
 )
 @click.option(
     "--filter-func-kwargs",
-    help="A json string that will be parsed as a dict and injected as kwargs into the filter after the path",
+    help="A json string that will be parsed as a dict and injected as kwargs into the filter after the path [DEPRECATED, use --filter which accepts muliple fnctions]",
+)
+@click.option(
+    "--filter",
+    type=(str, str),
+    nargs=2,
+    multiple=True,
+    help="Provide a set of 2 strings, the first being the module.function and the second a json string that will be parsed as a dict and injected as kwargs ino the function. The first positional parameter that the functions must accept is the path of the file to check.",
 )
 @click.option(
     "--ignore",
@@ -1034,6 +1140,12 @@ def do_initial_sync_and_or_restart(
     default=3600,
     help="set irods session maximum lifetime (in seconds) after which a fresh session is created (lazy)",
 )
+@click.option(
+    "--symlink-strategy",
+    type=click.Choice(["follow", "ignore"]),
+    default="follow",
+    help="Set the symlink strategy, default is 'follow'. Other option is 'ignore' and more to follow in future releases",
+)
 @click.pass_context
 def mango_ingest(
     ctx,
@@ -1047,6 +1159,7 @@ def mango_ingest(
     glob,
     filter_func,
     filter_func_kwargs,
+    filter,
     ignore,
     ignore_glob,
     sync,
@@ -1062,6 +1175,7 @@ def mango_ingest(
     metadata_option_unit_value,
     metadata_verbatim,
     irods_session_refresh,
+    symlink_strategy,
 ):
     """
     ManGO ingest is a lightweight tool to monitor a local directory for file changes and ingest (part of) them into iRODS.
@@ -1197,6 +1311,12 @@ def mango_ingest(
                 f"iRODS destination {destination} is not reachable, check if it exists and verify access rights for {username}"
             )
 
+        ## set global variables
+        global local_base_dir
+        global irods_destination
+        local_base_dir = path
+        irods_destination = destination
+
         # process metadata options
         if metadata_verbatim:
             metadata_option_name_prefix = metadata_option_unit_value = ""
@@ -1262,19 +1382,68 @@ def mango_ingest(
                 metadata_handlers.append(
                     (extract_metadata_from_path, {"path_regex": path_e})
                 )
-        # check for custom filter_func
+
+        # list of filter functions to call
+        # each element is a tuple of the function itself and the kwargs, like the metadata handlers
+        filter_functions = []
+
+        # check for custom filter_func DEPRECATED
         if filter_func and "." in filter_func:
             (filter_module, filter_function) = filter_func.rsplit(".", 1)
-        filter_func_module = (
-            importlib.import_module(filter_module) if filter_func else None
-        )
-        filter_func = (
-            getattr(filter_func_module, filter_function) if filter_func_module else None
-        )
-        filter_func_kwargs = (
-            json.loads(filter_func_kwargs) if filter_func_kwargs else {}
-        )
+            filter_func_module = (
+                importlib.import_module(filter_module) if filter_func else None
+            )
+            filter_func = (
+                getattr(filter_func_module, filter_function)
+                if filter_func_module
+                else None
+            )
+            filter_func_kwargs = (
+                json.loads(filter_func_kwargs) if filter_func_kwargs else {}
+            )
+            # now add to filter_functions
+            if filter_func is not None:
+                filter_functions.append(
+                    (
+                        filter_func,
+                        filter_func_kwargs,
+                    )
+                )
 
+        # new --filter option, using a tuple, also multiple filters can be specified
+        if filter:
+            print(f"Custom filters: {filter}")
+            for (_filter_func, _filter_func_kwargs) in filter:
+                if _filter_func and "." in _filter_func:
+                    #try:
+                    (_filter_module, _filter_function) = _filter_func.rsplit(".", 1)
+                    _filter_func_module = (
+                        importlib.import_module(_filter_module)
+                        if _filter_func
+                        else None
+                    )
+                    _filter_func = (
+                        getattr(_filter_func_module, _filter_function)
+                        if _filter_func_module
+                        else None
+                    )
+                    _filter_func_kwargs = (
+                        json.loads(_filter_func_kwargs)
+                        if _filter_func_kwargs
+                        else {}
+                    )
+                    # now add to filter_functions
+                    if _filter_func is not None:
+                        filter_functions.append(
+                            (
+                                _filter_func,
+                                _filter_func_kwargs,
+                            )
+                        )
+                    # except:
+                    #     pass
+
+        print(f"Processed filter functions {filter_functions}")
         if metadata_mtime:
             metadata_handlers.append(
                 (
@@ -1293,8 +1462,9 @@ def mango_ingest(
                 regex=regex,
                 glob=sync_glob,
                 ignore=ignore,
-                filter=filter_func,
-                filter_kwargs=filter_func_kwargs,
+                # filter=filter_func,
+                # filter_kwargs=filter_func_kwargs,
+                filters = filter_functions,
                 restart_paths=restart_paths,
                 verify_checksum=verify_checksum,
                 metadata_handlers=metadata_handlers,
@@ -1310,6 +1480,7 @@ def mango_ingest(
                     irods_destination=destination,
                     filter=filter_func,
                     filter_kwargs=filter_func_kwargs,
+                    filters = filter_functions,
                     verify_checksum=verify_checksum,
                     regexes=regex,  # class RegexMatchingEventHandler
                     ignore_regexes=ignore,  # class RegexMatchingEventHandler
