@@ -1006,10 +1006,6 @@ def do_initial_sync_and_or_restart(
                     metadata_option_name_prefix=metadata_option_name_prefix,
                     metadata_option_unit_value=metadata_option_unit_value,
                 )
-                if upload_result:
-                    result["success"].append(get_upload_status_record(full_path))
-                else:
-                    result["failed"].append(get_upload_status_record(full_path))
             else:
                 result["ignored"].append(get_upload_status_record(full_path))
                 continue
