@@ -840,6 +840,7 @@ def upload_to_irods(
             irods_session.data_objects.put(
                 local_path=local_path, irods_path=dst_path, updatables=(pbar_update,)
             )
+            irods_session.data_objects.touch(dst_path, no_create=True, seconds_since_epoch=int(local_path.stat().st_mtime))
     else:
         # pre prc 2.1.0 progressbar
         # utility iterator to read the local file in chunks: saves local disk space(!) and feeds a
