@@ -153,6 +153,7 @@ def get_upload_status_record(
 ## simple caching and re-use, to expand like mango flow/ mango portal with expiry checks?
 irods_session: iRODSSession | None = None
 irods_session_refresh_interval = 3600  # in seconds, default 1 hour
+irods_session_connection_timeout = 3600  # in seconds, default 1 hour
 
 
 def get_irods_session(backoff=None) -> iRODSSession:
@@ -187,6 +188,7 @@ def get_irods_session(backoff=None) -> iRODSSession:
         application_name="ManGO Ingest",
         refresh_time=max(int(irods_session_refresh_interval / 5), 600),
     )
+    irods_session.connection_timeout = irods_session_connection_timeout
     setattr(irods_session, "mi_created", now_as_utc_timestamp())
     print(f"Created a fresh irods session with timestamp {irods_session.mi_created}")
 
