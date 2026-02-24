@@ -52,14 +52,23 @@ class MangoIngestException(Exception):
 ##### global variables / objects
 
 ## basic runtime control
+# core arguments
+local_base_dir = None
+irods_destination = None
+# logging parameter, by default nothing is printed except fatal errors
 verbosity_level = 0
+# run mode
 dry_run = False
+# How to treat symlinks (linux/mac), None means just treat them as regular files
+# other options are 'ignore', 'ignore-log', 'metadata'
+symlink_strategy = "follow"
+## global helper variable for stdout using Rich module
 console = Console()
 # adaptive sleep times enabler, this variable is controlled by the core
 # upload_to_irods function
 busy_uploading = False
 # for PRC >=2.1.0, use native callback for progressbar
-progress_bar_irods = True if version_as_tuple() >= (2,1,0) else False
+progress_bar_irods = True if version_as_tuple() >= (2, 1, 0) else False
 
 ## global result variables
 result = {
@@ -93,9 +102,6 @@ def print(*args, verbosity=1, **kwargs):
 
 # now even go further, also imported modules will get the overridden print method
 builtins.print = print
-
-## simple caching and re-use, to expand like mango flow/ mango portal with expiry checks?
-irods_session: iRODSSession | None = None
 
 
 def now_as_utc_timestamp() -> float:
@@ -143,13 +149,29 @@ def get_upload_status_record(
 
 
 ## session init
-def get_irods_session() -> iRODSSession:
 
-    # need to check session timeout for long running operations, copy management from mango portal?
-    # although its likely used using a long valid ingress account when deployed in production
+## simple caching and re-use, to expand like mango flow/ mango portal with expiry checks?
+irods_session: iRODSSession | None = None
+irods_session_refresh_interval = 3600  # in seconds, default 1 hour
+irods_session_connection_timeout = 3600  # in seconds, default 1 hour
 
-    if irods_session:
+
+def get_irods_session(backoff=None) -> iRODSSession:
+    global irods_session
+
+    # if the irods_session is fresh enough, return it after validation
+    if irods_session and irods_session.mi_created > (
+        now_as_utc_timestamp() - irods_session_refresh_interval
+    ):
         return irods_session
+
+    # refresh if session is older than  irods_session_refresh_interval
+    # try to cleanup current, but ignore fatal errors
+    if irods_session:
+        try:
+            irods_session.cleanup()
+        except Exception as e:
+            print(f"Cleanup of irods_session resulted in exception {e}")
 
     try:
         env_file = os.environ["IRODS_ENVIRONMENT_FILE"]
@@ -160,11 +182,21 @@ def get_irods_session() -> iRODSSession:
     )
     ssl_settings = {"ssl_context": ssl_context}
 
-    return iRODSSession(irods_env_file=env_file, **ssl_settings)
+    irods_session = iRODSSession(
+        irods_env_file=env_file,
+        **ssl_settings,
+        application_name="ManGO Ingest",
+        refresh_time=max(int(irods_session_refresh_interval / 5), 600),
+    )
+    irods_session.connection_timeout = irods_session_connection_timeout
+    setattr(irods_session, "mi_created", now_as_utc_timestamp())
+    print(f"Created a fresh irods session with timestamp {irods_session.mi_created}")
+
+    return irods_session
 
 
 ## cache helper for irods_mkdir_p below
-def cache_key_path_only(irods_sesion, collection_path):
+def cache_key_path_only(irods_session, collection_path):
     return hashkey(collection_path)
 
 
@@ -174,7 +206,9 @@ def cache_key_path_only(irods_sesion, collection_path):
 )
 def irods_mkdir_p(irods_session: iRODSSession, collection_path: str):
     try:
-        irods_session.collections.create(collection_path)
+        # recurse=True is the default, but make it explicit for you the reader of this
+        # code that we really want this :-)
+        irods_session.collections.create(collection_path, recurse=True)
     except Exception as e:
         # should ideally be more specific, if the collection alreay exists, fine,
         # if any other exception, should exit()
@@ -182,30 +216,64 @@ def irods_mkdir_p(irods_session: iRODSSession, collection_path: str):
     return collection_path
 
 
+# short lived cache in use: it may be used to check for links but also return symlink info as metadata
+# after upload (not implemented yet).
+@cachetools.cached(cache=TTLCache(maxsize=500, ttl=(120 * 60)))
+def check_symlink(
+    path: str | pathlib.Path, base_path: str | None = None, recursive=True
+) -> list:
+    detected_symlinks = []
+    path_to_check = pathlib.Path(path)
+    if base_path:
+        path_to_check = path_to_check.relative_to(base_path)
+    if path_to_check.is_symlink():
+        detected_symlinks.append(
+            (
+                str(path_to_check),
+                str(path_to_check.readlink()),
+            )
+        )
+    if recursive:
+        # avoid the "." or "/" check
+        for parent in path_to_check.parents[:-1]:
+            if parent.is_symlink():
+                detected_symlinks.append(
+                    (
+                        str(parent),
+                        str(parent.readlink()),
+                    )
+                )
+    return detected_symlinks
+
+
 # This function is copied from ManGO Flow: safely add or replace AVU triplets
 # based on a dict {'name': 'value', ...} value can be lists
 def bulk_add_metadata(
     item: iRODSDataObject | iRODSCollection,
     metadata_items: dict,
-    unit_text: str = "analysis/mango_ingest",
     as_admin=False,
-    prefix="",
+    metadata_option_name_prefix="",
+    metadata_option_unit_value="",
 ):
     if metadata_items:
         metadata_names = metadata_items.keys()
         avu_operations = [
             AVUOperation(operation="remove", avu=avu)
             for avu in item.metadata.items()
-            if avu.name in metadata_names
+            if f"{metadata_option_name_prefix}{avu.name}" in metadata_names
         ]
         for m_name, m_value in metadata_items.items():
-            m_name = prefix + m_name
+            m_name = metadata_option_name_prefix + m_name
             if type(m_value) == list:
                 avu_operations.extend(
                     [
                         AVUOperation(
                             "add",
-                            iRODSMeta(name=m_name, value=sub_value, units=unit_text),
+                            iRODSMeta(
+                                name=m_name,
+                                value=sub_value,
+                                units=metadata_option_unit_value,
+                            ),
                         )
                         for sub_value in m_value
                     ]
@@ -215,7 +283,9 @@ def bulk_add_metadata(
                 avu_operations.append(
                     AVUOperation(
                         operation="add",
-                        avu=iRODSMeta(name=m_name, value=m_value, units=unit_text),
+                        avu=iRODSMeta(
+                            name=m_name, value=m_value, units=metadata_option_unit_value
+                        ),
                     )
                 )
             else:
@@ -317,6 +387,54 @@ def check_filters(
     return True
 
 
+def check_path_upload_eligibility(
+    file_path: pathlib.Path,
+    regexes: list | None = None,
+    filters: list | None = None,
+    filter_strategy: str = "and",
+    filter_log: str | bool = False, # not implemented yet
+) -> bool:
+
+    # create empty iterators
+    if regexes is None:
+        regexes = []
+    if filters is None:
+        filters = []
+
+    regex_match = False if regexes else True # if no regexes, it is treaded as regex match anything
+    if regexes and any(re.search(pattern, str(file_path)) for pattern in regexes):
+        regex_match = True
+    filters_matches = []
+    if filter_strategy.lower() == "or" and regexes and regex_match:
+        # do not bother to execue the filters. But this is an unlikely use case
+        return True
+    for (filter, filter_kwargs) in filters:
+        print(
+            f"validating against custom filter  with {filter_kwargs}",
+            style="bold blue",
+            verbosity=2,
+        )
+        try:
+            if not filter(file_path, **filter_kwargs):
+                print("external rule returned False", style="red bold")
+                filters_matches.append(False)
+            else:
+                filters_matches.append(True)
+        except Exception as e:
+            print(
+                f"An error occurred with external validation: {e} .. Continuing though"
+            )
+            filters_matches.append(False)
+        filters_matches.append(regex_match)
+    overall_result = (
+        all(filters_matches)
+        if filter_strategy.lower() == "and"
+        else any(filters_matches)
+    )
+    # potentially log this later
+    return overall_result
+
+
 ## watcher class
 class ManGOIngestWatcher(object):
     """ """
@@ -385,10 +503,13 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
         self.observer = observer
         self.filter = kwargs.pop("filter", None)
         self.filter_kwargs = kwargs.pop("filter_kwargs", None)
+        self.filters = kwargs.pop("filters", None)
         self.verify_checksum = kwargs.pop("verify_checksum", False)
         self.metadata_handlers = kwargs.pop("metadata_handlers", [])
+        self.metadata_option_unit_value = kwargs.pop("metadata_option_unit_value", "")
+        self.metadata_option_name_prefix = kwargs.pop("metadata_option_name_prefix", "")
         interval = kwargs.pop("queue_interval", 10)
-        time_at_rest_criterion = kwargs.pop("time_at_rest_criterion", 4)
+        time_at_rest_criterion = kwargs.pop("time_at_rest_criterion", interval)
 
         # delay queue
         self.delay_queue = {}
@@ -435,7 +556,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
             self.delay_queue_last_visit = now_as_utc_timestamp()
             self.delay_queue_lock.acquire()
             print(
-                f"Processing {len(self.delay_queue)} items in delay queue", verbosity=2
+                f"Processing {len(self.delay_queue)} items in delay queue", verbosity=3
             )
             for path, item in self.delay_queue.items():
                 # check if mtime has changed since the recorded mtime
@@ -445,6 +566,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
                 current_path_mtime = pathlib.Path(path).stat().st_mtime
                 now_as_timestamp = now_as_utc_timestamp()
                 if current_path_mtime != item["event_path_mtime"]:
+                    # item has been modified since last check
                     # set to the reported value, which for whatever reason can be far different from now()
                     self.delay_queue[path]["event_path_mtime"] = current_path_mtime
                     self.delay_queue[path]["event_timestamp"] = now_as_timestamp
@@ -503,8 +625,16 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
         if any(r.search(p) for r in self.ignore_regexes for p in paths):
             return
 
-        if any(r.search(p) for r in self.regexes for p in paths):
-            super().dispatch(event)
+        # if any(r.search(p) for r in self.regexes for p in paths):
+        #     super().dispatch(event)
+        for p in paths:
+            if check_path_upload_eligibility(file_path=pathlib.Path(p), regexes=self.regexes, filters=self.filters):
+                # add reporting on the matches list
+                super().dispatch(event)
+            else:
+                # add reporting on the ignore list
+                pass
+
 
     def handle_event(self, event: FileSystemEvent):
         # exclude directory creation, we are ony interested in files (for now)
@@ -543,7 +673,10 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
                 local_base_path=self.path,
                 verify_checksum=self.verify_checksum,
                 metadata_handlers=self.metadata_handlers,
+                metadata_option_unit_value=self.metadata_option_unit_value,
+                metadata_option_name_prefix=self.metadata_option_name_prefix,
             )
+            # update timer for reporting
             global latest_result_time
             latest_result_time = datetime.datetime.now(datetime.timezone.utc)
         return
@@ -551,7 +684,7 @@ class ManGOIngestHandler(RegexMatchingEventHandler):
     # on_closed is called when writing to a file has finished and the handler is closed
     # native for linux
     def on_closed(self, event: FileSystemEvent) -> None:
-
+        # the only event we are sure it is safe to upload immediately
         # remove delay queue entry for this path if it exists, otherwise
         # it may be uploaded twice
         self.remove_delay_event_via_path(event.src_path)
@@ -649,6 +782,8 @@ def upload_to_irods(
     local_base_path: pathlib.Path | None = None,
     verify_checksum=False,
     metadata_handlers: list[(Callable, dict)] = [],
+    metadata_option_name_prefix="",
+    metadata_option_unit_value="",
 ):
     ## update the global busy uploading flag
     global busy_uploading
@@ -677,13 +812,12 @@ def upload_to_irods(
                 )
             ),
         )
-    
+
     # consruct the irods destination full path
     dst_path = str(
         pathlib.PurePosixPath(irods_collection, str(rel_local_path.as_posix()))
     )
     print(f"Destination path for upload is {dst_path}", verbosity=2)
-
 
     if progress_bar_irods:
 
@@ -708,6 +842,7 @@ def upload_to_irods(
             irods_session.data_objects.put(
                 local_path=local_path, irods_path=dst_path, updatables=(pbar_update,)
             )
+            irods_session.data_objects.touch(dst_path, no_create=True, seconds_since_epoch=int(local_path.stat().st_mtime))
     else:
         # pre prc 2.1.0 progressbar
         # utility iterator to read the local file in chunks: saves local disk space(!) and feeds a
@@ -719,12 +854,13 @@ def upload_to_irods(
                     break
                 yield data
 
-        
-        #make the local read buffer 32MB
+        # make the local read buffer 32MB
         buffering = 32 * 1024 * 1024
-        #open the file with cool 'Rich' progress bar as a console display asset which implictely decorates a regular open()
+        # open the file with cool 'Rich' progress bar as a console display asset which implictely decorates a regular open()
         with rich.progress.open(local_path, "rb", buffering=buffering) as f:
-            with irods_session.data_objects.open(dst_path, "w", auto_close=True) as f_dst:
+            with irods_session.data_objects.open(
+                dst_path, "w", auto_close=True
+            ) as f_dst:
                 for chunk in read_in_chuncks(f):
                     f_dst.write(chunk)
 
@@ -760,7 +896,10 @@ def upload_to_irods(
                 metadata_dict |= metadata_handler(str(local_path), **kwargs)
             if metadata_dict:
                 bulk_add_metadata(
-                    item=result_object, metadata_items=metadata_dict, prefix="mg."
+                    item=result_object,
+                    metadata_items=metadata_dict,
+                    metadata_option_unit_value=metadata_option_unit_value,
+                    metadata_option_name_prefix=metadata_option_name_prefix,
                 )
                 print(
                     f"Added {len(metadata_dict)} metadata items to {result_object.name}"
@@ -789,11 +928,14 @@ def do_initial_sync_and_or_restart(
     regex=[],
     filter=None,
     filter_kwargs=None,
+    filters=None,
     glob="*",
     restart_paths=[],  # list of path strings
     ignore=None,
     verify_checksum=False,
     metadata_handlers: list[(Callable, dict)] = [],
+    metadata_option_name_prefix="",
+    metadata_option_unit_value="",
 ) -> dict:
 
     path_objects = []
@@ -814,13 +956,16 @@ def do_initial_sync_and_or_restart(
             ):
                 print(f"ignoring {full_path}", verbosity=2)
                 continue
-
-            if check_filters(
-                full_path,
-                regexes=regex,
-                filter=filter,
-                filter_kwargs=filter_kwargs,
+            if check_path_upload_eligibility(
+                file_path=full_path, regexes=regex, filters=filters
             ):
+
+                # if check_filters(
+                #     full_path,
+                #     regexes=regex,
+                #     filter=filter,
+                #     filter_kwargs=filter_kwargs,
+                # ):
                 result["matched"].append(get_upload_status_record(full_path))
                 if dry_run:
                     print(f"dry-run: would upload {full_path}")
@@ -861,13 +1006,11 @@ def do_initial_sync_and_or_restart(
                     local_base_path=path,
                     verify_checksum=verify_checksum,
                     metadata_handlers=metadata_handlers,
+                    metadata_option_name_prefix=metadata_option_name_prefix,
+                    metadata_option_unit_value=metadata_option_unit_value,
                 )
-                if upload_result:
-                    result["success"].append(get_upload_status_record(full_path))
-                else:
-                    result["failed"].append(get_upload_status_record(full_path))
             else:
-                result["ingnored"].append(get_upload_status_record(full_path))
+                result["ignored"].append(get_upload_status_record(full_path))
                 continue
         else:
             print(f" did not treat local dir {path_object}", verbosity=2)
@@ -892,8 +1035,8 @@ def do_initial_sync_and_or_restart(
     type=click.Choice(["native", "polling"]),
     help="The observer system to use for getting changed paths. "
     "Defaults to 'polling' which is recommended for most use cases, but you can use also 'native' "
-    "for linux/mac filesystems when watching for new files that are directly written into the directory"
-    "polling is a rather brute force algorithm, needed for network mounted drives and windows for example",
+    "for linux/mac filesystems when watching for new files that are directly written into the directory. "
+    "Polling is a rather brute force algorithm, needed for network mounted drives and windows for example",
 )
 @click.option(
     "--polling-interval",
@@ -911,11 +1054,18 @@ def do_initial_sync_and_or_restart(
 )
 @click.option(
     "--filter-func",
-    help="use an external filter (along regex/glob patterns), it will be dynamically imported",
+    help="use an external filter (along regex/glob patterns), it will be dynamically imported [DEPRECATED, use --filter which accepts muliple fnctions]",
 )
 @click.option(
     "--filter-func-kwargs",
-    help="A json string that will be parsed as a dict and injected as kwargs into the filter after the path",
+    help="A json string that will be parsed as a dict and injected as kwargs into the filter after the path [DEPRECATED, use --filter which accepts muliple fnctions]",
+)
+@click.option(
+    "--filter",
+    type=(str, str),
+    nargs=2,
+    multiple=True,
+    help="Provide a set of 2 strings, the first being the module.function and the second a json string that will be parsed as a dict and injected as kwargs ino the function. The first positional parameter that the functions must accept is the path of the file to check.",
 )
 @click.option(
     "--ignore",
@@ -969,6 +1119,32 @@ def do_initial_sync_and_or_restart(
     "--md-handler-kwargs",
     help="kwargs parameters for the metadata-handler as a json string",
 )
+@click.option(
+    "--metadata-option-name-prefix",
+    default="mg.",
+    help="set prefix for extracted metadata name Avu",
+)
+@click.option(
+    "--metadata-option-unit-value",
+    default="analysis/mango_ingest",
+    help="set unit value for extracted metadata avU",
+)
+@click.option(
+    "--metadata-verbatim",
+    is_flag=True,
+    help="leave all metadata items as they are (same as specifying empty values for the --metadata-option-* parameters)",
+)
+@click.option(
+    "--irods-session-refresh",
+    default=3600,
+    help="set irods session maximum lifetime (in seconds) after which a fresh session is created (lazy)",
+)
+@click.option(
+    "--symlink-strategy",
+    type=click.Choice(["follow", "ignore"]),
+    default="follow",
+    help="Set the symlink strategy, default is 'follow'. Other option is 'ignore' and more to follow in future releases",
+)
 @click.pass_context
 def mango_ingest(
     ctx,
@@ -982,6 +1158,7 @@ def mango_ingest(
     glob,
     filter_func,
     filter_func_kwargs,
+    filter,
     ignore,
     ignore_glob,
     sync,
@@ -993,6 +1170,11 @@ def mango_ingest(
     metadata_mtime,
     metadata_handler,
     metadata_handler_kwargs,
+    metadata_option_name_prefix,
+    metadata_option_unit_value,
+    metadata_verbatim,
+    irods_session_refresh,
+    symlink_strategy,
 ):
     """
     ManGO ingest is a lightweight tool to monitor a local directory for file changes and ingest (part of) them into iRODS.
@@ -1052,7 +1234,7 @@ def mango_ingest(
         # since the option is not marked as required in order to have the option fall back
         # through environment variables and/or config file, we need to check and get it here
         if not destination:
-            destination = click.prompt("Please enter an iRODS destination patha")
+            destination = click.prompt("Please enter an iRODS destination path")
 
         if verbose or do_dry_run:
             global verbosity_level
@@ -1116,6 +1298,32 @@ def mango_ingest(
         if not (irods_session := get_irods_session()):
             exit("Cannot obtain a valid irods session")
 
+        # check if destination exists/ is reachable
+        # this check should be controllable by another setting to create the destination
+        # path if it does not exist
+        try:
+            irods_session.collections.get(destination)
+        except Exception as e:
+            username = irods_session.username
+            irods_session.cleanup()
+            exit(
+                f"iRODS destination {destination} is not reachable, check if it exists and verify access rights for {username}"
+            )
+
+        ## set global variables
+        global local_base_dir
+        global irods_destination
+        local_base_dir = path
+        irods_destination = destination
+
+        # process metadata options
+        if metadata_verbatim:
+            metadata_option_name_prefix = metadata_option_unit_value = ""
+
+        global irods_session_refresh_interval
+        if irods_session_refresh and irods_session_refresh > 0:
+            irods_session_refresh_interval = irods_session_refresh
+
         sync_glob = None
         if sync or no_watch:
             sync_glob = glob[0] if (len(glob) == 1 and not regex) else "*"
@@ -1173,19 +1381,68 @@ def mango_ingest(
                 metadata_handlers.append(
                     (extract_metadata_from_path, {"path_regex": path_e})
                 )
-        # check for custom filter_func
+
+        # list of filter functions to call
+        # each element is a tuple of the function itself and the kwargs, like the metadata handlers
+        filter_functions = []
+
+        # check for custom filter_func DEPRECATED
         if filter_func and "." in filter_func:
             (filter_module, filter_function) = filter_func.rsplit(".", 1)
-        filter_func_module = (
-            importlib.import_module(filter_module) if filter_func else None
-        )
-        filter_func = (
-            getattr(filter_func_module, filter_function) if filter_func_module else None
-        )
-        filter_func_kwargs = (
-            json.loads(filter_func_kwargs) if filter_func_kwargs else {}
-        )
+            filter_func_module = (
+                importlib.import_module(filter_module) if filter_func else None
+            )
+            filter_func = (
+                getattr(filter_func_module, filter_function)
+                if filter_func_module
+                else None
+            )
+            filter_func_kwargs = (
+                json.loads(filter_func_kwargs) if filter_func_kwargs else {}
+            )
+            # now add to filter_functions
+            if filter_func is not None:
+                filter_functions.append(
+                    (
+                        filter_func,
+                        filter_func_kwargs,
+                    )
+                )
 
+        # new --filter option, using a tuple, also multiple filters can be specified
+        if filter:
+            print(f"Custom filters: {filter}")
+            for (_filter_func, _filter_func_kwargs) in filter:
+                if _filter_func and "." in _filter_func:
+                    #try:
+                    (_filter_module, _filter_function) = _filter_func.rsplit(".", 1)
+                    _filter_func_module = (
+                        importlib.import_module(_filter_module)
+                        if _filter_func
+                        else None
+                    )
+                    _filter_func = (
+                        getattr(_filter_func_module, _filter_function)
+                        if _filter_func_module
+                        else None
+                    )
+                    _filter_func_kwargs = (
+                        json.loads(_filter_func_kwargs)
+                        if _filter_func_kwargs
+                        else {}
+                    )
+                    # now add to filter_functions
+                    if _filter_func is not None:
+                        filter_functions.append(
+                            (
+                                _filter_func,
+                                _filter_func_kwargs,
+                            )
+                        )
+                    # except:
+                    #     pass
+
+        print(f"Processed filter functions {filter_functions}")
         if metadata_mtime:
             metadata_handlers.append(
                 (
@@ -1204,11 +1461,14 @@ def mango_ingest(
                 regex=regex,
                 glob=sync_glob,
                 ignore=ignore,
-                filter=filter_func,
-                filter_kwargs=filter_func_kwargs,
+                # filter=filter_func,
+                # filter_kwargs=filter_func_kwargs,
+                filters = filter_functions,
                 restart_paths=restart_paths,
                 verify_checksum=verify_checksum,
                 metadata_handlers=metadata_handlers,
+                metadata_option_name_prefix=metadata_option_name_prefix,
+                metadata_option_unit_value=metadata_option_unit_value,
             )
 
         if not no_watch:
@@ -1219,12 +1479,15 @@ def mango_ingest(
                     irods_destination=destination,
                     filter=filter_func,
                     filter_kwargs=filter_func_kwargs,
+                    filters = filter_functions,
                     verify_checksum=verify_checksum,
-                    metadata_handlers=metadata_handlers,
                     regexes=regex,  # class RegexMatchingEventHandler
                     ignore_regexes=ignore,  # class RegexMatchingEventHandler
                     ignore_directories=True,  # class RegexMatchingEventHandler
                     observer=observer,
+                    metadata_handlers=metadata_handlers,
+                    metadata_option_name_prefix=metadata_option_name_prefix,
+                    metadata_option_unit_value=metadata_option_unit_value,
                 ),
                 recursive=recursive,
                 observer=observer,
@@ -1244,7 +1507,7 @@ def mango_ingest(
 @mango_ingest.command()
 @click.pass_context
 def examples(ctx):
-    """
+    r"""
     Examples
 
     The examples below assume the executable is in your PATH. Note that the order of the options does not matter

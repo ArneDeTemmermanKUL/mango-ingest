@@ -8,7 +8,7 @@ import pathlib
 from exiftool import ExifToolHelper  
 
 # start the exiftool helper, it uses a daemon mode
-md_extractor = ExifToolHelper()
+md_extractor = ExifToolHelper(common_args = [])
 
 def extract(path: str, mode="sidecar", sidecar_ext="exiftool.metadata.json"):
     """
@@ -24,7 +24,7 @@ def extract(path: str, mode="sidecar", sidecar_ext="exiftool.metadata.json"):
         return {}
     # we do not want to compromise any calling process
     try:
-        metadata = md_extractor.get_metadata(path)
+        metadata = md_extractor.get_metadata(path, params = ["-j", "-struct"])
     except Exception as e:
         print(f"Exception in metadata extraction: {e}")
         return {}
